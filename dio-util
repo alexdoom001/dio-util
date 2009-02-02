@@ -1,0 +1,190 @@
+#!/bin/sh
+
+usage()
+{
+	echo "
+$0 - generate configuration for setkey utility
+
+-i int           tunnel id
+-k path          directory with key info
+-K hex           explicitly specify gost key
+-S hex           explicitly specify gost sbox
+-N int           explicitly specify number of keys in series
+-C int           explicitly specify local crypto number
+-c int           remote crypto number
+-l ip            local end tunnel ip
+-r ip            remote end tunnel ip
+-L ipnet         local net
+-R ipnet         remote net
+-p port          port to use in rule [any]
+-P proto         protocol to use in rule [any]
+-a in|out|inout  generate SA (tunnel)
+-s in|out|inout  generate SP (selectors for tunnel)
+-A allow|deny    select action (allow or deny tunneling) for SP [allow]
+-h none          this help
+
+-l,-r                      : needed always
+-a,-i,[-k|-K,-S,-N,-C],-c  : needed for SA creation
+-s,-L,-R,-p,-P,-A          : needed for SP creation
+"
+}
+
+ERROR()
+{
+	echo $@ >&2
+	exit 1
+}
+
+ID=
+KEYDIR=
+CN=
+LIP=
+RIP=
+LNET=
+RNET=
+PORT=0
+PROTO=0
+SA=
+SP=
+ACT=allow
+
+args=`getopt -o i:k:K:S:N:C:c:l:r:L:R:p:P:a:s:A:h -- "$@"`
+eval set -- "$args"
+
+while [ "$1" != "--" ]; do
+	case "$1" in
+	-h) usage; exit 0;;
+	-i) ID=$2; shift;;
+	-k) KEYDIR=$2; shift;;
+	-K) KEY=$2; shift;;
+	-S) SBOX=$2; shift;;
+	-N) NUMKEYS=$2; shift;;
+	-C) OWNCN=$2; shift;;
+	-c) CN=$2; shift;;
+	-l) LIP=$2; shift;;
+	-r) RIP=$2; shift;;
+	-L) LNET=$2; shift;;
+	-R) RNET=$2; shift;;
+	-p) PORT=$2; shift;;
+	-P) PROTO=$2; shift;;
+	-a) SA=$2; shift;;
+	-s) SP=$2; shift;;
+	-A) ACT=$2; shift;;
+	esac
+	shift
+done
+shift
+
+if [ -n "$ID" ] && [ "$ID" -lt "0" -o "$ID" -gt 65535 ]; then
+	ERROR "tunnel id have to be within range 0-65535"
+fi
+
+if [ -n "$KEYDIR" ] && ! [ -d "$KEYDIR" ]; then
+	ERROR "$KEYDIR: no such directory"
+fi
+
+if [ -n "$KEYDIR" ]; then
+	keyinfo=`./dio-key -sSON -kall $KEYDIR`
+	[ -z "$keyinfo" ] && ERROR "error while parsing key info"
+
+	SBOX=`echo "$keyinfo" | grep ^SBOX | cut -f2 `
+	OWNCN=`echo "$keyinfo" | grep ^OWN_CN | cut -f2`
+	NUMKEYS=`echo "$keyinfo" | grep ^NUMKEYS | cut -f2`
+fi
+
+[ -z "$SBOX" ] && ERROR "gost-sbox is not specified"
+[ -z "$NUMKEYS" ] && ERROR "numkeys is not specified"
+[ -z "$OWNCN" ] && ERROR "local crypto number is not specified"
+
+if [ -n "$CN" ]; then
+	if [ "$CN" -le "0" -o "$CN" -gt "$NUMKEYS" ]; then
+		ERROR "remote crypto number have to be within range 1-$NUMKEYS"
+	fi
+	[ "$CN" -eq "$OWNCN" ] && echo "WARNING: local and remote crypto numbers are equal" >&2
+fi
+
+[ -n "$KEYDIR" ] && KEY=`echo "$keyinfo" | grep "^KEY\[$CN\]" | cut -f2`
+[ -z "$KEY" ] && ERROR "gost key is not specified"
+
+if [ "$ACT" = "allow" ]; then ACT=ipsec
+elif [ "$ACT" = "deny" ]; then ACT=none
+else ERROR "$ACT: action have to be 'allow' or 'deny'"
+
+verify_ipv4()
+{
+	local mask=${1#*/}
+	local addr=${1%/*}
+	[ "$mask" = "$addr" ] && mask=
+	local addrval=0
+	local maskval=0
+	local power2=1
+	local addrpart=
+	local i=
+	local OLDIFS="$IFS"
+	local IFS="."
+	for addrpart in $addr; do
+		[ "$addrpart" -lt "0" -o "$addrpart" -gt "255" ] && return 1
+		addrval=$((addrval * 256 + addrpart))
+	done
+	IFS="$OLDIFS"
+	if [ -n "$mask" ]; then
+		[ "$mask" -lt "0" -o "$mask" -gt "32" ] && return 1
+		for i in `seq 1 $((32 - mask))`; do
+			maskval=$((power2 + maskval))
+			power2=$((power2 * 2))
+		done
+		[ "$((maskval & addrval))" -ne "0" ] && return 1
+	fi
+	return 0
+}
+
+[ -z "$LIP" ] && ERROR "local ip is not specified"
+[ -z "$RIP" ] && ERROR "remote ip is not specified"
+
+for ip in $LIP $RIP $LNET $RNET; do
+	[ -z "$ip" ] && continue
+	if ! verify_ipv4 "$ip"; then ERROR "$ip: incorrect ip address"; fi
+done
+
+if [ "$PORT" -lt "0" -o "$PORT" -gt 65535 ]; then
+	ERROR "port number have to be within range 0-65535 (0 <=> any)"
+fi
+
+if [ "$PROTO" -lt "0" -o "$PROTO" -gt 255 ]; then
+	ERROR "protocol number have to be within range 0-255 (0 <=> any)"
+fi
+
+if [ -n "$SA" ]; then
+	[ "$SA" != "in" -a "$SA" != "out" -a "$SA" != "inout" ] &&
+	  ERROR "wrong SA parameter"
+	KEY=`echo "$keyinfo" | grep "^KEY\[$CN\]" | cut -f2`
+	if [ "$SA" = "out" -o "$SA" = "inout" ]; then
+		echo "\
+add $LIP $RIP dio $ID cn $OWNCN -m tunnel
+ -E gost-key $key
+ -A gost-sbox $SBOX;
+"
+	fi
+	if [ "$SA" = "in" -o "$SA" = "inout" ]; then
+		echo "\
+add $RIP $LIP dio $ID cn $CN -m tunnel
+ -E gost-key $key
+ -A gost-sbox $SBOX;
+"
+	fi
+fi
+
+if [ -n "$SP" ]; then
+	[ "$SP" != "in" -a "$SP" != "out" -a "$SP" != "inout" ] &&
+	  ERROR "wrong SP parameter"
+	if [ "$PORT" -eq "0" ]; then PORT=; else PORT="[$PORT]"; fi
+	[ "$PROTO" -eq "0" ] && PROTO=any
+	if [ "$SP" = "out" -o "$SP" = "inout" ]; then
+		echo "\
+spdadd ${LNET}$PORT ${RNET}$PORT $PROTO -P out $ACT dio/tunnel/$LIP-$RIP/require;"
+	fi
+	if [ "$SP" = "in" -o "$SP" = "inout" ]; then
+		echo "\
+spdadd ${RNET}$PORT ${LNET}$PORT $PROTO -P out $ACT dio/tunnel/$RIP-$LIP/require;"
+	fi
+fi
