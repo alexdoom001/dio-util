@@ -451,9 +451,9 @@ static int get_pckt(FILE *f)
 
 	for (u = 0; u < hdr.n; u++)
 	{
-		key_mac.mac = le32_to_cpu(key_mac.mac);
 		dio_decode_key(key_mac.key, pckt->x[u].key, bkey, cache);
 		dio_get_key_mac(&key_mac.mac, key_mac.key, bkey, cache);
+		key_mac.mac = le32_to_cpu(key_mac.mac);
 
 		if (pckt->x[u].mac != key_mac.mac)
 		{

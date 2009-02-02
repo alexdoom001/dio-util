@@ -6,12 +6,13 @@ OBJ = dio-key.o
 
 CC ?= gcc
 CFLAGS ?= -std=c99 -Wall -O2
+LDFLAGS ?=
 DESTDIR ?= /
 
 all: $(EXE)
 
 $(EXE): $(OBJ)
-	$(CC) -s -o $@ $^
+	$(CC) -s $(LDFLAGS) -o $@ $^
 
 $(OBJ): Makefile
 

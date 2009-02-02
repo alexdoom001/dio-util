@@ -4,6 +4,7 @@ usage()
 {
 	echo "
 $0 - generate configuration for setkey utility
+$0 [-ikKSNCclrLRpPasAnh] add | del
 
 -i int           tunnel id
 -k path          directory with key info
@@ -20,12 +21,13 @@ $0 - generate configuration for setkey utility
 -P proto         protocol to use in rule [any]
 -a in|out|inout  generate SA (tunnel)
 -s in|out|inout  generate SP (selectors for tunnel)
--A allow|deny    select action (allow or deny tunneling) for SP [allow]
+-A allow|forbid  select action (allow or forbid tunneling) for SP [allow]
+-n int           number of rule (lower number => higher priority)
 -h none          this help
 
 -l,-r                      : needed always
 -a,-i,[-k|-K,-S,-N,-C],-c  : needed for SA creation
--s,-L,-R,-p,-P,-A          : needed for SP creation
+-s,-L,-R,-p,-P,-A,-n       : needed for SP creation
 "
 }
 
@@ -47,8 +49,9 @@ PROTO=0
 SA=
 SP=
 ACT=allow
+MODE=
 
-args=`getopt -o i:k:K:S:N:C:c:l:r:L:R:p:P:a:s:A:h -- "$@"`
+args=`getopt -o i:k:K:S:N:C:c:l:r:L:R:p:P:a:s:A:n:h -- "$@"`
 eval set -- "$args"
 
 while [ "$1" != "--" ]; do
@@ -69,46 +72,60 @@ while [ "$1" != "--" ]; do
 	-P) PROTO=$2; shift;;
 	-a) SA=$2; shift;;
 	-s) SP=$2; shift;;
+	-n) RULE=$2; shift;;
 	-A) ACT=$2; shift;;
 	esac
 	shift
 done
 shift
 
+MODE=$1
+if [ "$MODE" = "add" ]; then
+	SACMD=add
+	SPCMD=spdadd
+elif [ "$MODE" = "del" ]; then
+	SACMD=delete
+	SPCMD=spddelete
+else
+	ERROR "wrong mode \"$MODE\". Please specify \"add\" or \"del\"."
+fi
+
 if [ -n "$ID" ] && [ "$ID" -lt "0" -o "$ID" -gt 65535 ]; then
 	ERROR "tunnel id have to be within range 0-65535"
 fi
 
-if [ -n "$KEYDIR" ] && ! [ -d "$KEYDIR" ]; then
-	ERROR "$KEYDIR: no such directory"
-fi
-
-if [ -n "$KEYDIR" ]; then
-	keyinfo=`./dio-key -sSON -kall $KEYDIR`
-	[ -z "$keyinfo" ] && ERROR "error while parsing key info"
-
-	SBOX=`echo "$keyinfo" | grep ^SBOX | cut -f2 `
-	OWNCN=`echo "$keyinfo" | grep ^OWN_CN | cut -f2`
-	NUMKEYS=`echo "$keyinfo" | grep ^NUMKEYS | cut -f2`
-fi
-
-[ -z "$SBOX" ] && ERROR "gost-sbox is not specified"
-[ -z "$NUMKEYS" ] && ERROR "numkeys is not specified"
-[ -z "$OWNCN" ] && ERROR "local crypto number is not specified"
-
-if [ -n "$CN" ]; then
-	if [ "$CN" -le "0" -o "$CN" -gt "$NUMKEYS" ]; then
-		ERROR "remote crypto number have to be within range 1-$NUMKEYS"
+if [ -n "$SA" ]; then
+	if [ -n "$KEYDIR" ] && ! [ -d "$KEYDIR" ]; then
+		ERROR "$KEYDIR: no such directory"
 	fi
-	[ "$CN" -eq "$OWNCN" ] && echo "WARNING: local and remote crypto numbers are equal" >&2
-fi
+	if [ -n "$KEYDIR" ]; then
+		keyinfo=`dio-key -sSON -kall $KEYDIR`
+		[ -z "$keyinfo" ] && ERROR "error while parsing key info"
 
-[ -n "$KEYDIR" ] && KEY=`echo "$keyinfo" | grep "^KEY\[$CN\]" | cut -f2`
-[ -z "$KEY" ] && ERROR "gost key is not specified"
+		SBOX=`echo "$keyinfo" | grep ^SBOX | cut -f2 `
+		OWNCN=`echo "$keyinfo" | grep ^OWN_CN | cut -f2`
+		NUMKEYS=`echo "$keyinfo" | grep ^NUMKEYS | cut -f2`
+		[ -z "$CN" ] && ERROR "remote crypto number is not specified"
+	fi
+
+	[ -z "$SBOX" ] && ERROR "gost-sbox is not specified"
+	[ -z "$NUMKEYS" ] && ERROR "numkeys is not specified"
+	[ -z "$OWNCN" ] && ERROR "local crypto number is not specified"
+
+	if [ -n "$CN" ]; then
+		if [ "$CN" -le "0" -o "$CN" -gt "$NUMKEYS" ]; then
+			ERROR "remote crypto number have to be within range 1-$NUMKEYS"
+		fi
+		[ "$CN" -eq "$OWNCN" ] && echo "WARNING: local and remote crypto numbers are equal" >&2
+	fi
+	[ -n "$KEYDIR" ] && KEY=`echo "$keyinfo" | grep "^KEY\[$CN\]" | cut -f2`
+	[ -z "$KEY" ] && ERROR "gost key is not specified"
+fi
 
 if [ "$ACT" = "allow" ]; then ACT=ipsec
-elif [ "$ACT" = "deny" ]; then ACT=none
-else ERROR "$ACT: action have to be 'allow' or 'deny'"
+elif [ "$ACT" = "forbid" ]; then ACT=none
+else ERROR "$ACT: action have to be 'allow' or 'forbid'"
+fi
 
 verify_ipv4()
 {
@@ -157,34 +174,42 @@ fi
 if [ -n "$SA" ]; then
 	[ "$SA" != "in" -a "$SA" != "out" -a "$SA" != "inout" ] &&
 	  ERROR "wrong SA parameter"
-	KEY=`echo "$keyinfo" | grep "^KEY\[$CN\]" | cut -f2`
+	[ -z "$ID" ] && ERROR "tunnel id is not specified"
 	if [ "$SA" = "out" -o "$SA" = "inout" ]; then
-		echo "\
-add $LIP $RIP dio $ID cn $OWNCN -m tunnel
- -E gost-key $key
- -A gost-sbox $SBOX;
+		output="$SACMD $LIP $RIP dio $ID"
+		[ "$MODE" = "add" ] && output="${output} cn $OWNCN -m tunnel
+ -E gost-key $KEY
+ -A gost-sbox $SBOX
 "
+		echo "${output};"
 	fi
 	if [ "$SA" = "in" -o "$SA" = "inout" ]; then
-		echo "\
-add $RIP $LIP dio $ID cn $CN -m tunnel
- -E gost-key $key
- -A gost-sbox $SBOX;
+		output="$SACMD $RIP $LIP dio $ID"
+		[ "$MODE" = "add" ] && output="${output} cn $CN -m tunnel
+ -E gost-key $KEY
+ -A gost-sbox $SBOX
 "
+		echo "${output};"
 	fi
 fi
 
 if [ -n "$SP" ]; then
 	[ "$SP" != "in" -a "$SP" != "out" -a "$SP" != "inout" ] &&
 	  ERROR "wrong SP parameter"
+	[ -z "$LNET" ] && ERROR "local subnet is not specified"
+	[ -z "$RNET" ] && ERROR "remote subnet is not specified"
 	if [ "$PORT" -eq "0" ]; then PORT=; else PORT="[$PORT]"; fi
 	[ "$PROTO" -eq "0" ] && PROTO=any
+	if [ -n "$RULE" ]; then
+		[ "$RULE" -lt "0" ] && ERROR "rule number have not to be less than 0"
+		PRIO="prio -$RULE"
+	fi
 	if [ "$SP" = "out" -o "$SP" = "inout" ]; then
 		echo "\
-spdadd ${LNET}$PORT ${RNET}$PORT $PROTO -P out $ACT dio/tunnel/$LIP-$RIP/require;"
+$SPCMD ${LNET}$PORT ${RNET}$PORT $PROTO -P out $PRIO $ACT dio/tunnel/$LIP-$RIP/require;"
 	fi
 	if [ "$SP" = "in" -o "$SP" = "inout" ]; then
 		echo "\
-spdadd ${RNET}$PORT ${LNET}$PORT $PROTO -P out $ACT dio/tunnel/$RIP-$LIP/require;"
+$SPCMD ${RNET}$PORT ${LNET}$PORT $PROTO -P in $PRIO $ACT dio/tunnel/$RIP-$LIP/require;"
 	fi
 fi
